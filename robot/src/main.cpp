@@ -2,12 +2,15 @@
 #include <Servo.h>
 
 /* -----------------------------------------------------------
- *  遥感控制舵机程序
- *  - 遥感控制：X轴-A4，Y轴-A5
- *  - 方向映射：
- *    将360度分成36个方向(每10度一个)
- *    基于8个基准方向计算所有其他方向的舵机角度
- *  - 遥感回中时，舵机自动回到中间位置
+ *  遥感和按钮控制舵机程序
+ *  - 遥感控制：X轴-A4，Y轴-A5 (比例速率控制)
+ *  - 按钮控制：
+ *    上按钮(D12) - 所有舵机角度增加
+ *    下按钮(D11) - 所有舵机角度减少
+ *    复位按钮(D2) - 所有舵机到最小角度
+ *    回中按钮(A3) - 所有舵机到预设中心点
+ *  - 使用结构体和时间戳进行按钮消抖
+ *  - 遥感无自动回中，控制舵机移动速率
  * -----------------------------------------------------------
  */
 
@@ -20,10 +23,26 @@ const int SERVO3_PIN = 8;
 const byte JOYSTICK_X_PIN = A4;  // 遥感X轴
 const byte JOYSTICK_Y_PIN = A5;  // 遥感Y轴
 
-// 遥感参数
-const float DEADZONE = 0.2;      // 死区大小(0-1)
-const int ANGLE_SEGMENTS = 36;   // 将360度分成36份，每份10度
-const int SERVO_UPDATE_RATE = 50; // 舵机更新间隔(ms)
+// 定义按钮引脚
+const byte UP_PIN = 12;        // 向上按钮
+const byte DOWN_PIN = 11;      // 向下按钮
+const byte RESET_PIN = 2;      // 复位按钮 (舵机到最小角度)
+const byte CENTER_JOY_PIN = A3; // 手动回中按钮 (舵机到预设中心)
+
+// 控制参数
+const float DEADZONE = 0.2;      // 遥感死区大小(0-1)
+const int SERVO_UPDATE_RATE = 30; // 主循环延迟(ms) - 更快以支持平滑速率控制
+const unsigned long DEBOUNCE_MS = 5; // 按钮消抖时间
+const int ANGLE_STEP = 10;       // 按钮控制的舵机角度步长
+const float JOYSTICK_SENSITIVITY = 0.05f; // 遥感速率控制灵敏度 (0.01-0.2 建议范围)
+
+// 每个舵机的角度范围限制
+const int MIN_ANGLE_1 = 0;
+const int MAX_ANGLE_1 = 180;
+const int MIN_ANGLE_2 = 0;
+const int MAX_ANGLE_2 = 180;
+const int MIN_ANGLE_3 = 0;
+const int MAX_ANGLE_3 = 180;
 
 // 遥感读数变量
 int joystickX;
@@ -34,19 +53,39 @@ Servo servo1;
 Servo servo2;
 Servo servo3;
 
-// 定义舵机中立位置
+// 当前舵机角度 (使用浮点数以实现平滑速率控制)
+float currentServo1Pos = 180.0f; 
+float currentServo2Pos = 180.0f;
+float currentServo3Pos = 180.0f;
+
+// 定义舵机中立位置 (手动回中按钮A3使用)
 const int SERVO1_CENTER = 180;
 const int SERVO2_CENTER = 180;
 const int SERVO3_CENTER = 180;
 
-// 定义基准方向的舵机角度
+// Button struct for debouncing
+struct Button {
+  const char*   name;
+  byte          pin;
+  bool          stableState;    // Debounced state
+  bool          lastReading;    // Previous raw reading
+  unsigned long lastChangeTime; // Time of last unstable reading
+};
+
+Button buttons[] = {
+  { "UP",       UP_PIN,         HIGH, HIGH, 0 },
+  { "DOWN",     DOWN_PIN,       HIGH, HIGH, 0 },
+  { "RESET",    RESET_PIN,      HIGH, HIGH, 0 },
+  { "CENTER",   CENTER_JOY_PIN, HIGH, HIGH, 0 }
+};
+
+// 定义基准方向的舵机角度 (遥感用 - 代表全速偏转时的目标方向)
 struct ServoAngles {
     int servo1;
     int servo2;
     int servo3;
 };
 
-// 8个基准方向的舵机角度 (以45度为间隔)
 const ServoAngles BASE_DIRECTIONS[] = {
     {180, 0, 60},    // 上 (0度)
     {180, 0, 0},     // 右上 (45度)
@@ -58,126 +97,167 @@ const ServoAngles BASE_DIRECTIONS[] = {
     {180, 0, 180}    // 左上 (315度)
 };
 
-// 计算两个基准方向之间的角度的舵机位置
+// 函数声明
+void moveServos(float s1, float s2, float s3); // Now accepts floats
+void moveToCenterPosition();
+void moveUp();
+void moveDown();
+void resetToMinPosition();
+ServoAngles interpolateDirection(float angle);
+void mapJoystickToServos();
+void handleButtons();
+
 ServoAngles interpolateDirection(float angle) {
-    // 找出最近的两个基准方向
-    int baseSector = (int)(angle / 45.0);
+    int baseSector = (int)(angle / 45.0f);
+    if (baseSector < 0) baseSector = 0; 
+    if (baseSector > 7) baseSector = 7;
     int nextSector = (baseSector + 1) % 8;
-    
-    // 计算插值比例
-    float blend = (angle - (baseSector * 45.0)) / 45.0;
-    
-    // 创建插值结果
+    float blend = (angle - (baseSector * 45.0f)) / 45.0f;
+    if (blend < 0.0f) blend = 0.0f; 
+    if (blend > 1.0f) blend = 1.0f;
+
     ServoAngles result;
-    
-    // 插值计算三个舵机的角度
-    result.servo1 = BASE_DIRECTIONS[baseSector].servo1 * (1 - blend) + 
-                    BASE_DIRECTIONS[nextSector].servo1 * blend;
-    result.servo2 = BASE_DIRECTIONS[baseSector].servo2 * (1 - blend) + 
-                    BASE_DIRECTIONS[nextSector].servo2 * blend;
-    result.servo3 = BASE_DIRECTIONS[baseSector].servo3 * (1 - blend) + 
-                    BASE_DIRECTIONS[nextSector].servo3 * blend;
-    
+    result.servo1 = round(BASE_DIRECTIONS[baseSector].servo1 * (1.0f - blend) + BASE_DIRECTIONS[nextSector].servo1 * blend);
+    result.servo2 = round(BASE_DIRECTIONS[baseSector].servo2 * (1.0f - blend) + BASE_DIRECTIONS[nextSector].servo2 * blend);
+    result.servo3 = round(BASE_DIRECTIONS[baseSector].servo3 * (1.0f - blend) + BASE_DIRECTIONS[nextSector].servo3 * blend);
     return result;
 }
 
-// 将舵机移动到指定角度
-void moveServos(int servo1Angle, int servo2Angle, int servo3Angle) {
-    servo1.write(servo1Angle);
-    servo2.write(servo2Angle);
-    servo3.write(servo3Angle);
+void moveServos(float s1, float s2, float s3) { // Accepts floats
+    currentServo1Pos = constrain(s1, (float)MIN_ANGLE_1, (float)MAX_ANGLE_1);
+    currentServo2Pos = constrain(s2, (float)MIN_ANGLE_2, (float)MAX_ANGLE_2);
+    currentServo3Pos = constrain(s3, (float)MIN_ANGLE_3, (float)MAX_ANGLE_3);
     
-    // 调试输出
-    Serial.print("舵机角度: ");
-    Serial.print(servo1Angle);
-    Serial.print(", ");
-    Serial.print(servo2Angle);
-    Serial.print(", ");
-    Serial.println(servo3Angle);
+    servo1.write(round(currentServo1Pos)); // Write rounded int to servo
+    servo2.write(round(currentServo2Pos));
+    servo3.write(round(currentServo3Pos));
+    
+    // Reduced frequency debug output
+    static unsigned long lastServoDebugTime = 0;
+    if (millis() - lastServoDebugTime > 200) { // Output every 200ms
+        Serial.print("舵机目标(float): ");
+        Serial.print(currentServo1Pos, 2); Serial.print(", ");
+        Serial.print(currentServo2Pos, 2); Serial.print(", ");
+        Serial.print(currentServo3Pos, 2); Serial.print(" -> Int: ");
+        Serial.print(round(currentServo1Pos)); Serial.print(", ");
+        Serial.print(round(currentServo2Pos)); Serial.print(", ");
+        Serial.println(round(currentServo3Pos));
+        lastServoDebugTime = millis();
+    }
 }
 
-// 将舵机移动到中间位置
 void moveToCenterPosition() {
-    moveServos(SERVO1_CENTER, SERVO2_CENTER, SERVO3_CENTER);
-    Serial.println("舵机回到中间位置");
+    moveServos((float)SERVO1_CENTER, (float)SERVO2_CENTER, (float)SERVO3_CENTER);
+    Serial.println("按钮: 舵机回到预设中心位置.");
 }
 
-// 将遥感值映射到角度并控制舵机
+void moveUp() {
+    moveServos(currentServo1Pos + ANGLE_STEP, 
+               currentServo2Pos + ANGLE_STEP, 
+               currentServo3Pos + ANGLE_STEP);
+    Serial.println("按钮: 向上移动...");
+}
+
+void moveDown() {
+    moveServos(currentServo1Pos - ANGLE_STEP, 
+               currentServo2Pos - ANGLE_STEP, 
+               currentServo3Pos - ANGLE_STEP);
+    Serial.println("按钮: 向下移动...");
+}
+
+void resetToMinPosition() { 
+    moveServos((float)MIN_ANGLE_1, (float)MIN_ANGLE_2, (float)MIN_ANGLE_3);
+    Serial.println("按钮: 已重置到最小角度.");
+}
+
 void mapJoystickToServos() {
-    // 读取遥感值
     joystickX = analogRead(JOYSTICK_X_PIN);
     joystickY = analogRead(JOYSTICK_Y_PIN);
+    float x_mapped = map(joystickX, 0, 1023, -100, 100);
+    float y_mapped = map(joystickY, 0, 1023, -100, 100);
+    float angle_rad = atan2(y_mapped, x_mapped);
+    float angle_deg = angle_rad * 180.0f / PI;
+    if (angle_deg < 0) angle_deg += 360.0f;
+    float strength = sqrt(x_mapped*x_mapped + y_mapped*y_mapped); // Raw strength 0-~141
 
-    // 将遥感值转换为-100到100的范围
-    float x = map(joystickX, 0, 1023, -100, 100);
-    float y = map(joystickY, 0, 1023, -100, 100);
-
-    // 计算遥感的角度和强度
-    float angle = atan2(y, x) * 180 / PI;
-    if (angle < 0) angle += 360;  // 转换到0-360度范围
-    float strength = sqrt(x*x + y*y) / 100.0;
-    
-    // 调试输出遥感信息
-    Serial.print("遥感: X=");
-    Serial.print(x);
-    Serial.print(", Y=");
-    Serial.print(y);
-    Serial.print(", 强度=");
-    Serial.print(strength);
-    Serial.print(", 角度=");
-    Serial.println(angle);
-    
-    // 如果遥感在死区内，移动到中间位置
-    if (strength < DEADZONE) {
-        moveToCenterPosition();
-        return;
+    if (strength / 100.0f < DEADZONE) { // Normalize strength for deadzone check
+        // Joystick is in deadzone, servos hold current position.
+        return; 
     }
     
-    // 计算当前角度所在的10度分段
-    int segment = (int)(angle / 10.0); // 0-35的分段
-    
-    // 使用插值计算对应的舵机角度
-    ServoAngles servoPos = interpolateDirection(angle);
+    // Normalize strength: 0 at deadzone edge, 1 at full deflection (approx 100 for map output)
+    float normalized_strength = (strength - (DEADZONE * 100.0f)) / (100.0f - (DEADZONE * 100.0f));
+    normalized_strength = constrain(normalized_strength, 0.0f, 1.0f);
 
-    // 移动舵机
-    moveServos(servoPos.servo1, servoPos.servo2, servoPos.servo3);
-    
-    // 额外的调试信息
-    Serial.print("分段: ");
-    Serial.println(segment);
+    ServoAngles targetDirectionPos = interpolateDirection(angle_deg);
+
+    float delta1 = (targetDirectionPos.servo1 - currentServo1Pos) * normalized_strength * JOYSTICK_SENSITIVITY;
+    float delta2 = (targetDirectionPos.servo2 - currentServo2Pos) * normalized_strength * JOYSTICK_SENSITIVITY;
+    float delta3 = (targetDirectionPos.servo3 - currentServo3Pos) * normalized_strength * JOYSTICK_SENSITIVITY;
+
+    moveServos(currentServo1Pos + delta1, 
+               currentServo2Pos + delta2, 
+               currentServo3Pos + delta3);
+
+    // Optional: Reduced frequency joystick debug output
+    static unsigned long lastJoyDebug = 0;
+    if (millis() - lastJoyDebug > 250) { 
+       Serial.print("遥感: Str="); Serial.print(strength,1);
+       Serial.print(" NormStr="); Serial.print(normalized_strength,2);
+       Serial.print(" Ang="); Serial.print(angle_deg,1);
+       Serial.print(" TargetDir(S1)="); Serial.print(targetDirectionPos.servo1);
+       Serial.print(" Delta1="); Serial.println(delta1, 2);
+       lastJoyDebug = millis();
+    }
+}
+
+void handleButtons() {
+  unsigned long now = millis();
+  for (auto &btn : buttons) {
+    bool reading = digitalRead(btn.pin);
+    if (reading != btn.lastReading) {
+      btn.lastReading = reading;
+      btn.lastChangeTime = now;
+    }
+    if ((now - btn.lastChangeTime) >= DEBOUNCE_MS && reading != btn.stableState) {
+      btn.stableState = reading; 
+      if (btn.stableState == LOW) { // PRESSED
+        if (btn.pin == UP_PIN) {
+          moveUp();
+        } else if (btn.pin == DOWN_PIN) {
+          moveDown();
+        } else if (btn.pin == RESET_PIN) {
+          resetToMinPosition(); 
+        } else if (btn.pin == CENTER_JOY_PIN) {
+          moveToCenterPosition();
+        }
+      } 
+    }
+  }
 }
 
 void setup() {
-    Serial.begin(9600);
-    Serial.println("遥感36方向舵机控制程序启动");
+    Serial.begin(9600); 
+    Serial.println("遥感(速率)和按钮控制 - V4");
     
-    // 初始化遥感引脚为输入
     pinMode(JOYSTICK_X_PIN, INPUT);
     pinMode(JOYSTICK_Y_PIN, INPUT);
+    
+    pinMode(UP_PIN, INPUT_PULLUP);
+    pinMode(DOWN_PIN, INPUT_PULLUP);
+    pinMode(RESET_PIN, INPUT_PULLUP);
+    pinMode(CENTER_JOY_PIN, INPUT_PULLUP); 
 
-    // 初始化舵机
     servo1.attach(SERVO1_PIN);
     servo2.attach(SERVO2_PIN);
     servo3.attach(SERVO3_PIN);
     
-    // 初始化时将舵机移动到中间位置
-    moveToCenterPosition();
-    
-    // 输出基准方向信息
-    Serial.println("基准方向舵机角度:");
-    for (int i = 0; i < 8; i++) {
-        Serial.print(i * 45);
-        Serial.print("度: (");
-        Serial.print(BASE_DIRECTIONS[i].servo1);
-        Serial.print(", ");
-        Serial.print(BASE_DIRECTIONS[i].servo2);
-        Serial.print(", ");
-        Serial.print(BASE_DIRECTIONS[i].servo3);
-        Serial.println(")");
-    }
+    moveServos(currentServo1Pos, currentServo2Pos, currentServo3Pos);
+    Serial.println("初始位置已设置."); // currentServoXPos are already initialized
 }
 
 void loop() {
+    handleButtons();
     mapJoystickToServos();
     delay(SERVO_UPDATE_RATE);
 }
