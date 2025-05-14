@@ -26,13 +26,16 @@ const byte JOYSTICK_Y_PIN = A5;  // 遥感Y轴
 // 定义按钮引脚
 const byte UP_PIN = 12;        // 向上按钮 (物理上的"上"按钮，增加角度)
 const byte DOWN_PIN = 11;      // 向下按钮 (物理上的"下"按钮，减少角度)
-const byte RESET_PIN = 2;      // 复位按钮 (舵机到最小角度)
+const byte MOS_CONTROL_BUTTON_PIN = 4; // Renamed from RESET_PIN, this is for MOS control
 const byte CENTER_JOY_PIN = A3; // 手动回中按钮 (舵机到预设中心)
+
+// Define MOS管引脚
+const byte MOS_PIN = 3;
 
 // 控制参数
 const float DEADZONE = 0.2;      // 遥感死区大小(0-1)
 const int SERVO_UPDATE_RATE = 30; // 主循环延迟(ms)
-const unsigned long DEBOUNCE_MS = 5; // 按钮消抖时间
+const unsigned long DEBOUNCE_MS = 50; // 按钮消抖时间 (Increased from 5)
 const int ANGLE_STEP = 5;       // 按钮控制的舵机角度步长 (减小以便长按时更平滑)
 const float JOYSTICK_SENSITIVITY = 0.05f; // 遥感速率控制灵敏度
 
@@ -76,7 +79,7 @@ struct Button {
 Button buttons[] = {
   { "UP",       UP_PIN,         HIGH, HIGH, 0, false },
   { "DOWN",     DOWN_PIN,       HIGH, HIGH, 0, false },
-  { "RESET",    RESET_PIN,      HIGH, HIGH, 0, false },
+  { "MOS_CTRL", MOS_CONTROL_BUTTON_PIN, HIGH, HIGH, 0, false }, // Changed from "RESET" and RESET_PIN
   { "CENTER",   CENTER_JOY_PIN, HIGH, HIGH, 0, false }
 };
 
@@ -221,12 +224,9 @@ void handleButtons() {
     if (reading != btn.lastReading) {
       btn.lastReading = reading;
       btn.lastChangeTime = now;
-      btn.actionTakenOnPress = false; // Reset flag when button state changes (press or release)
     }
     if ((now - btn.lastChangeTime) >= DEBOUNCE_MS && reading != btn.stableState) {
       btn.stableState = reading; 
-      // For non-continuous buttons, actionTakenOnPress ensures single action per press
-      // For continuous buttons (UP/DOWN), we don't use actionTakenOnPress, action happens if LOW
     }
 
     // After debouncing, if button is firmly pressed (stableState is LOW)
@@ -235,19 +235,23 @@ void handleButtons() {
           servoAnglesIncrease(); // Continuous action while held
         } else if (btn.pin == DOWN_PIN) {
           servoAnglesDecrease(); // Continuous action while held
-        } else if (btn.pin == RESET_PIN) {
-          if (!btn.actionTakenOnPress) {
-            resetToMinPosition(); 
-            btn.actionTakenOnPress = true;
+        } else if (btn.pin == MOS_CONTROL_BUTTON_PIN) { 
+          if (!btn.actionTakenOnPress) { // Check the flag
+            bool currentMosState = digitalRead(MOS_PIN);
+            bool newMosState = !currentMosState;
+            digitalWrite(MOS_PIN, newMosState);
+            Serial.print("MOS_PIN (Pin 3) is now: ");
+            Serial.println(newMosState ? "HIGH" : "LOW");
+            btn.actionTakenOnPress = true; // Set the flag after acting
           }
         } else if (btn.pin == CENTER_JOY_PIN) {
-          if (!btn.actionTakenOnPress) {
+          if (!btn.actionTakenOnPress) { // Check the flag
             moveToCenterPosition();
-            btn.actionTakenOnPress = true;
+            btn.actionTakenOnPress = true; // Set the flag after acting
           }
         }
       } else { // Button is HIGH (released or not pressed)
-          btn.actionTakenOnPress = false; // Reset flag when button is released
+          btn.actionTakenOnPress = false; // Reset flag when button is released - THIS IS THE CORRECT PLACE TO RESET
       } 
   }
 }
@@ -261,8 +265,10 @@ void setup() {
     
     pinMode(UP_PIN, INPUT_PULLUP);
     pinMode(DOWN_PIN, INPUT_PULLUP);
-    pinMode(RESET_PIN, INPUT_PULLUP);
-    pinMode(CENTER_JOY_PIN, INPUT_PULLUP); 
+    pinMode(MOS_CONTROL_BUTTON_PIN, INPUT_PULLUP); // Changed from RESET_PIN
+    pinMode(CENTER_JOY_PIN, INPUT_PULLUP);
+    pinMode(MOS_PIN, OUTPUT); // MOS_PIN setup
+    digitalWrite(MOS_PIN, LOW); // Set initial state for MOS_PIN
 
     servo1.attach(SERVO1_PIN);
     servo2.attach(SERVO2_PIN);
