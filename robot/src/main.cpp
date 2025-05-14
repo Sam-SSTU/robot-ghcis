@@ -5,10 +5,10 @@
  *  遥感和按钮控制舵机程序
  *  - 遥感控制：X轴-A4，Y轴-A5 (比例速率控制)
  *  - 按钮控制：
- *    上按钮(D12) - 所有舵机角度增加
- *    下按钮(D11) - 所有舵机角度减少
- *    复位按钮(D2) - 所有舵机到最小角度
- *    回中按钮(A3) - 所有舵机到预设中心点
+ *    上按钮(D12) - 所有舵机角度增加 (长按连续)
+ *    下按钮(D11) - 所有舵机角度减少 (长按连续)
+ *    复位按钮(D2) - 所有舵机到最小角度 (单次)
+ *    回中按钮(A3) - 所有舵机到预设中心点 (单次)
  *  - 使用结构体和时间戳进行按钮消抖
  *  - 遥感无自动回中，控制舵机移动速率
  * -----------------------------------------------------------
@@ -24,17 +24,17 @@ const byte JOYSTICK_X_PIN = A4;  // 遥感X轴
 const byte JOYSTICK_Y_PIN = A5;  // 遥感Y轴
 
 // 定义按钮引脚
-const byte UP_PIN = 12;        // 向上按钮
-const byte DOWN_PIN = 11;      // 向下按钮
+const byte UP_PIN = 12;        // 向上按钮 (物理上的"上"按钮，增加角度)
+const byte DOWN_PIN = 11;      // 向下按钮 (物理上的"下"按钮，减少角度)
 const byte RESET_PIN = 2;      // 复位按钮 (舵机到最小角度)
 const byte CENTER_JOY_PIN = A3; // 手动回中按钮 (舵机到预设中心)
 
 // 控制参数
 const float DEADZONE = 0.2;      // 遥感死区大小(0-1)
-const int SERVO_UPDATE_RATE = 30; // 主循环延迟(ms) - 更快以支持平滑速率控制
+const int SERVO_UPDATE_RATE = 30; // 主循环延迟(ms)
 const unsigned long DEBOUNCE_MS = 5; // 按钮消抖时间
-const int ANGLE_STEP = 10;       // 按钮控制的舵机角度步长
-const float JOYSTICK_SENSITIVITY = 0.05f; // 遥感速率控制灵敏度 (0.01-0.2 建议范围)
+const int ANGLE_STEP = 5;       // 按钮控制的舵机角度步长 (减小以便长按时更平滑)
+const float JOYSTICK_SENSITIVITY = 0.05f; // 遥感速率控制灵敏度
 
 // 每个舵机的角度范围限制
 const int MIN_ANGLE_1 = 0;
@@ -70,13 +70,14 @@ struct Button {
   bool          stableState;    // Debounced state
   bool          lastReading;    // Previous raw reading
   unsigned long lastChangeTime; // Time of last unstable reading
+  bool          actionTakenOnPress; // Flag to ensure single action for non-continuous buttons
 };
 
 Button buttons[] = {
-  { "UP",       UP_PIN,         HIGH, HIGH, 0 },
-  { "DOWN",     DOWN_PIN,       HIGH, HIGH, 0 },
-  { "RESET",    RESET_PIN,      HIGH, HIGH, 0 },
-  { "CENTER",   CENTER_JOY_PIN, HIGH, HIGH, 0 }
+  { "UP",       UP_PIN,         HIGH, HIGH, 0, false },
+  { "DOWN",     DOWN_PIN,       HIGH, HIGH, 0, false },
+  { "RESET",    RESET_PIN,      HIGH, HIGH, 0, false },
+  { "CENTER",   CENTER_JOY_PIN, HIGH, HIGH, 0, false }
 };
 
 // 定义基准方向的舵机角度 (遥感用 - 代表全速偏转时的目标方向)
@@ -100,8 +101,8 @@ const ServoAngles BASE_DIRECTIONS[] = {
 // 函数声明
 void moveServos(float s1, float s2, float s3); // Now accepts floats
 void moveToCenterPosition();
-void moveUp();
-void moveDown();
+void servoAnglesIncrease(); // Renamed for clarity, UP button increases angles
+void servoAnglesDecrease(); // Renamed for clarity, DOWN button decreases angles
 void resetToMinPosition();
 ServoAngles interpolateDirection(float angle);
 void mapJoystickToServos();
@@ -148,21 +149,23 @@ void moveServos(float s1, float s2, float s3) { // Accepts floats
 
 void moveToCenterPosition() {
     moveServos((float)SERVO1_CENTER, (float)SERVO2_CENTER, (float)SERVO3_CENTER);
-    Serial.println("按钮: 舵机回到预设中心位置.");
+    // Serial.println("按钮: 舵机回到预设中心位置."); // Reduce verbosity
 }
 
-void moveUp() {
+// UP button (e.g., D12) makes angles INCREASE
+void servoAnglesIncrease() {
     moveServos(currentServo1Pos + ANGLE_STEP, 
                currentServo2Pos + ANGLE_STEP, 
                currentServo3Pos + ANGLE_STEP);
-    Serial.println("按钮: 向上移动...");
+    // Serial.println("按钮: 角度增加中..."); // Reduce verbosity for continuous hold
 }
 
-void moveDown() {
+// DOWN button (e.g., D11) makes angles DECREASE
+void servoAnglesDecrease() {
     moveServos(currentServo1Pos - ANGLE_STEP, 
                currentServo2Pos - ANGLE_STEP, 
                currentServo3Pos - ANGLE_STEP);
-    Serial.println("按钮: 向下移动...");
+    // Serial.println("按钮: 角度减少中..."); // Reduce verbosity for continuous hold
 }
 
 void resetToMinPosition() { 
@@ -202,11 +205,11 @@ void mapJoystickToServos() {
     // Optional: Reduced frequency joystick debug output
     static unsigned long lastJoyDebug = 0;
     if (millis() - lastJoyDebug > 250) { 
-       Serial.print("遥感: Str="); Serial.print(strength,1);
-       Serial.print(" NormStr="); Serial.print(normalized_strength,2);
-       Serial.print(" Ang="); Serial.print(angle_deg,1);
-       Serial.print(" TargetDir(S1)="); Serial.print(targetDirectionPos.servo1);
-       Serial.print(" Delta1="); Serial.println(delta1, 2);
+       // Serial.print("遥感: Str="); Serial.print(strength,1);
+       // Serial.print(" NormStr="); Serial.print(normalized_strength,2);
+       // Serial.print(" Ang="); Serial.print(angle_deg,1);
+       // Serial.print(" TargetDir(S1)="); Serial.print(targetDirectionPos.servo1);
+       // Serial.print(" Delta1="); Serial.println(delta1, 2);
        lastJoyDebug = millis();
     }
 }
@@ -218,27 +221,40 @@ void handleButtons() {
     if (reading != btn.lastReading) {
       btn.lastReading = reading;
       btn.lastChangeTime = now;
+      btn.actionTakenOnPress = false; // Reset flag when button state changes (press or release)
     }
     if ((now - btn.lastChangeTime) >= DEBOUNCE_MS && reading != btn.stableState) {
       btn.stableState = reading; 
-      if (btn.stableState == LOW) { // PRESSED
-        if (btn.pin == UP_PIN) {
-          moveUp();
-        } else if (btn.pin == DOWN_PIN) {
-          moveDown();
-        } else if (btn.pin == RESET_PIN) {
-          resetToMinPosition(); 
-        } else if (btn.pin == CENTER_JOY_PIN) {
-          moveToCenterPosition();
-        }
-      } 
+      // For non-continuous buttons, actionTakenOnPress ensures single action per press
+      // For continuous buttons (UP/DOWN), we don't use actionTakenOnPress, action happens if LOW
     }
+
+    // After debouncing, if button is firmly pressed (stableState is LOW)
+    if (btn.stableState == LOW) { 
+        if (btn.pin == UP_PIN) {
+          servoAnglesIncrease(); // Continuous action while held
+        } else if (btn.pin == DOWN_PIN) {
+          servoAnglesDecrease(); // Continuous action while held
+        } else if (btn.pin == RESET_PIN) {
+          if (!btn.actionTakenOnPress) {
+            resetToMinPosition(); 
+            btn.actionTakenOnPress = true;
+          }
+        } else if (btn.pin == CENTER_JOY_PIN) {
+          if (!btn.actionTakenOnPress) {
+            moveToCenterPosition();
+            btn.actionTakenOnPress = true;
+          }
+        }
+      } else { // Button is HIGH (released or not pressed)
+          btn.actionTakenOnPress = false; // Reset flag when button is released
+      } 
   }
 }
 
 void setup() {
     Serial.begin(9600); 
-    Serial.println("遥感(速率)和按钮控制 - V4");
+    Serial.println("遥感(速率)和按钮控制 - V5 (长按)");
     
     pinMode(JOYSTICK_X_PIN, INPUT);
     pinMode(JOYSTICK_Y_PIN, INPUT);
