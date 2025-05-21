@@ -1,5 +1,21 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include <Adafruit_GFX.h>    // Core graphics library
+#include <Adafruit_ST7789.h> // Hardware-specific library for ST7789
+#include <SPI.h>             // Included for completeness, software SPI is used
+
+// TFT Pin Definitions (Software SPI)
+#define TFT_SCLK  7  // SPI Clock
+#define TFT_MOSI  6  // SPI Data (Master Out Slave In)
+#define TFT_CS    5  // Chip select control pin
+#define TFT_DC    2  // Data Command control pin
+#define TFT_RST   A0 // Reset pin
+#define TFT_BL    A2 // Backlight Control Pin (Connect to 5V or 3.3V through a resistor if always on, or to this pin for software control)
+
+#define ST77XX_DARKGREY 0x7BEF // Define a dark grey color (16-bit RGB565)
+
+// Initialize Adafruit ST7789 driver object for software SPI
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 
 /* -----------------------------------------------------------
  *  遥感和按钮控制舵机程序
@@ -34,10 +50,10 @@ const byte MOS_PIN = 3;
 
 // 控制参数
 const float DEADZONE = 0.2;      // 遥感死区大小(0-1)
-const int SERVO_UPDATE_RATE = 30; // 主循环延迟(ms)
+const int SERVO_UPDATE_RATE = 05; // 主循环延迟(ms)
 const unsigned long DEBOUNCE_MS = 50; // 按钮消抖时间 (Increased from 5)
-const int ANGLE_STEP = 5;       // 按钮控制的舵机角度步长 (减小以便长按时更平滑)
-const float JOYSTICK_SENSITIVITY = 0.05f; // 遥感速率控制灵敏度
+const int ANGLE_STEP = 3;       // 按钮控制的舵机角度步长 (减小以便长按时更平滑)
+const float JOYSTICK_SENSITIVITY = 0.02f; // 遥感速率控制灵敏度
 
 // 每个舵机的角度范围限制
 const int MIN_ANGLE_1 = 0;
@@ -110,7 +126,231 @@ void resetToMinPosition();
 ServoAngles interpolateDirection(float angle);
 void mapJoystickToServos();
 void handleButtons();
+void setupDisplay(); // New function for TFT setup
+void updateDisplay_cooperative(); // New function for TFT update
 
+// Display update timing and state variables (restored)
+unsigned long lastDisplayUpdateTime = 0;
+const unsigned long DISPLAY_UPDATE_INTERVAL = 20; // Keep this short for responsiveness
+
+// Variables for display state and selective updates
+int prev_joystickX_display = -1;
+int prev_joystickY_display = -1;
+bool prev_button_states_display[sizeof(buttons)/sizeof(Button)]; 
+String prev_joyX_str_display = "";
+String prev_joyY_str_display = "";
+
+// Enum for cooperative display update states (restored)
+enum DisplayUpdateState {
+    UPDATE_JOY_X_TEXT,
+    UPDATE_JOY_Y_TEXT,
+    UPDATE_JOY_GRAPHIC_BOX, // Draw the box once or if erased
+    UPDATE_JOY_GRAPHIC_DOT,
+    UPDATE_BUTTON_0, // Will iterate through buttons
+    UPDATE_BUTTON_1,
+    UPDATE_BUTTON_2,
+    UPDATE_BUTTON_3,
+    DISPLAY_UPDATE_COMPLETE
+};
+DisplayUpdateState currentDisplayState = UPDATE_JOY_X_TEXT;
+bool initial_draw_complete = false; // Flag to ensure full draw once
+
+void setupDisplay() {
+  #ifdef TFT_BL
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+  #endif
+
+  tft.init(240, 320);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_WHITE);
+  tft.setTextColor(ST77XX_BLACK);
+
+  // Draw centered title
+  tft.setTextSize(2);
+  const char* title = "Robot Control";
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+  tft.setCursor((320 - w) / 2, 5); // Center horizontally, 5 pixels from top
+  tft.print(title);
+  
+  // Draw horizontal line under title
+  tft.drawFastHLine(10, 25, 300, ST77XX_BLACK);
+  
+  Serial.println("LCD Initialized in Landscape Mode.");
+
+  for (size_t i = 0; i < sizeof(buttons)/sizeof(Button); ++i) {
+      prev_button_states_display[i] = !buttons[i].stableState;
+  }
+}
+
+// Restored updateDisplay_cooperative function
+void updateDisplay_cooperative() {
+    if (millis() - lastDisplayUpdateTime < DISPLAY_UPDATE_INTERVAL && initial_draw_complete) {
+        return; 
+    }
+    lastDisplayUpdateTime = millis();
+
+    tft.setTextSize(1);
+    switch (currentDisplayState) {
+        case UPDATE_JOY_X_TEXT: {
+            String current_joyX_str = "JoyX: " + String(joystickX);
+            if (current_joyX_str != prev_joyX_str_display || !initial_draw_complete) {
+                tft.setTextColor(ST77XX_BLACK, ST77XX_WHITE);
+                tft.fillRect(10, 8, 70, 12, ST77XX_WHITE); // Clear area
+                tft.setCursor(10, 10);
+                tft.print(current_joyX_str);
+                prev_joyX_str_display = current_joyX_str;
+            }
+            currentDisplayState = UPDATE_JOY_Y_TEXT;
+            break;
+        }
+        case UPDATE_JOY_Y_TEXT: {
+            String current_joyY_str = "JoyY: " + String(joystickY);
+            if (current_joyY_str != prev_joyY_str_display || !initial_draw_complete) {
+                tft.setTextColor(ST77XX_BLACK, ST77XX_WHITE);
+                tft.fillRect(10, 20, 70, 12, ST77XX_WHITE); // Clear area
+                tft.setCursor(10, 22);
+                tft.print(current_joyY_str);
+                prev_joyY_str_display = current_joyY_str;
+            }
+            currentDisplayState = UPDATE_JOY_GRAPHIC_BOX;
+            break;
+        }
+        case UPDATE_JOY_GRAPHIC_BOX: { 
+            if (!initial_draw_complete) { // Only draw initially or if explicitly needed
+                 int joyBoxX = 10, joyBoxY = 40, joyBoxSize = 50;
+                 tft.drawRect(joyBoxX, joyBoxY, joyBoxSize, joyBoxSize, ST77XX_BLACK);
+            }
+            currentDisplayState = UPDATE_JOY_GRAPHIC_DOT;
+            break;
+        }
+        case UPDATE_JOY_GRAPHIC_DOT: {
+            int joyBoxX = 10, joyBoxY = 40, joyBoxSize = 50;
+            if (prev_joystickX_display != -1) {
+                int prev_dotX = map(prev_joystickY_display, 0, 1023, joyBoxX + 2, joyBoxX + joyBoxSize - 3);
+                int prev_dotY = map(prev_joystickX_display, 1023, 0, joyBoxY + 2, joyBoxY + joyBoxSize - 3);
+                if (joystickX != prev_joystickX_display || joystickY != prev_joystickY_display || !initial_draw_complete) {
+                    tft.fillCircle(prev_dotX, prev_dotY, 3, ST77XX_WHITE);
+                }
+            }
+            if (joystickX != prev_joystickX_display || joystickY != prev_joystickY_display || !initial_draw_complete) {
+                int current_dotX = map(joystickY, 0, 1023, joyBoxX + 2, joyBoxX + joyBoxSize - 3);
+                int current_dotY = map(joystickX, 1023, 0, joyBoxY + 2, joyBoxY + joyBoxSize - 3);
+                tft.fillCircle(current_dotX, current_dotY, 3, ST77XX_RED);
+            }
+            prev_joystickX_display = joystickX;
+            prev_joystickY_display = joystickY;
+            currentDisplayState = UPDATE_BUTTON_0;
+            break;
+        }
+        case UPDATE_BUTTON_0:
+        case UPDATE_BUTTON_1:
+        case UPDATE_BUTTON_2:
+        case UPDATE_BUTTON_3: {
+            size_t button_idx = currentDisplayState - UPDATE_BUTTON_0;
+            if (button_idx < sizeof(buttons)/sizeof(Button)) {
+                int buttonDisplayStartX = 150, buttonDisplayStartY = 40;
+                int buttonRectHeight = 18, buttonRectWidth = 55, lineSpacing = 25;
+                int currentY = buttonDisplayStartY + (button_idx * lineSpacing);
+
+                if (buttons[button_idx].stableState != prev_button_states_display[button_idx] || !initial_draw_complete) {
+                    tft.setTextColor(ST77XX_BLACK, ST77XX_WHITE);
+                    tft.fillRect(buttonDisplayStartX, currentY, 40 + buttonRectWidth + 10, buttonRectHeight, ST77XX_WHITE);
+
+                    tft.setCursor(buttonDisplayStartX, currentY + (buttonRectHeight/2) - 4);
+                    tft.print(String(buttons[button_idx].name) + ":");
+                    int rectX = buttonDisplayStartX + 40;
+                    int16_t x1, y1; uint16_t w, h;
+
+                    // Invert the display logic for pins 4, 11, and 12
+                    bool isInvertedButton = (buttons[button_idx].pin == 4 || 
+                                           buttons[button_idx].pin == 11 || 
+                                           buttons[button_idx].pin == 12);
+                    bool displayAsPressed = isInvertedButton ? 
+                                          (buttons[button_idx].stableState == HIGH) : 
+                                          (buttons[button_idx].stableState == LOW);
+
+                    if (displayAsPressed) {
+                        tft.fillRect(rectX, currentY, buttonRectWidth, buttonRectHeight, ST77XX_GREEN);
+                        tft.setTextColor(ST77XX_WHITE);
+                        tft.getTextBounds("ON", rectX, currentY, &x1, &y1, &w, &h);
+                        tft.setCursor(rectX + (buttonRectWidth - w) / 2, currentY + (buttonRectHeight - h) / 2 + h);
+                        tft.print("ON");
+                    } else {
+                        tft.fillRect(rectX, currentY, buttonRectWidth, buttonRectHeight, ST77XX_DARKGREY);
+                        tft.setTextColor(ST77XX_WHITE);
+                        tft.getTextBounds("OFF", rectX, currentY, &x1, &y1, &w, &h);
+                        tft.setCursor(rectX + (buttonRectWidth - w) / 2, currentY + (buttonRectHeight - h) / 2 + h);
+                        tft.print("OFF");
+                    }
+                    prev_button_states_display[button_idx] = buttons[button_idx].stableState;
+                }
+            }
+            
+            // Draw electromagnetic status box
+            if (button_idx == 0 || !initial_draw_complete) {
+                int statusBoxX = 10, statusBoxY = 150;
+                int statusBoxWidth = 100, statusBoxHeight = 60;
+                
+                tft.drawRect(statusBoxX, statusBoxY, statusBoxWidth, statusBoxHeight, ST77XX_BLACK);
+                tft.setTextColor(ST77XX_BLACK, ST77XX_WHITE);
+                tft.setCursor(statusBoxX + 5, statusBoxY + 5);
+                tft.print("Magnet:");
+                
+                bool magnetState = digitalRead(MOS_PIN);
+                tft.fillRect(statusBoxX + 5, statusBoxY + 25, 
+                            statusBoxWidth - 10, statusBoxHeight - 30, 
+                            magnetState ? ST77XX_GREEN : ST77XX_RED);
+            }
+
+            if (button_idx + 1 < sizeof(buttons)/sizeof(Button)) {
+                currentDisplayState = (DisplayUpdateState)(UPDATE_BUTTON_0 + button_idx + 1);
+            } else {
+                currentDisplayState = DISPLAY_UPDATE_COMPLETE;
+            }
+            break;
+        }
+        case DISPLAY_UPDATE_COMPLETE: {
+            initial_draw_complete = true; 
+            currentDisplayState = UPDATE_JOY_X_TEXT; // Loop back for next full update cycle
+            break;
+        }
+    } // end switch
+}
+
+void setup() {
+    Serial.begin(9600);
+    Serial.println("遥感(速率)和按钮控制 - V5 (长按) + LCD");
+
+    pinMode(JOYSTICK_X_PIN, INPUT);
+    pinMode(JOYSTICK_Y_PIN, INPUT);
+    
+    pinMode(UP_PIN, INPUT_PULLUP);
+    pinMode(DOWN_PIN, INPUT_PULLUP);
+    pinMode(MOS_CONTROL_BUTTON_PIN, INPUT_PULLUP); // Changed from RESET_PIN
+    pinMode(CENTER_JOY_PIN, INPUT_PULLUP);
+    pinMode(MOS_PIN, OUTPUT); // MOS_PIN setup
+    digitalWrite(MOS_PIN, LOW); // Set initial state for MOS_PIN
+
+    servo1.attach(SERVO1_PIN);
+    servo2.attach(SERVO2_PIN);
+    servo3.attach(SERVO3_PIN);
+    
+    moveServos(currentServo1Pos, currentServo2Pos, currentServo3Pos);
+    setupDisplay(); // Initialize the LCD Display
+    Serial.println("初始位置已设置."); // currentServoXPos are already initialized
+}
+
+void loop() {
+    handleButtons();
+    mapJoystickToServos();
+    updateDisplay_cooperative(); // Restore direct call to cooperative display update
+    //delay(SERVO_UPDATE_RATE); // Re-enable delay with new, smaller SERVO_UPDATE_RATE
+}
+
+// Servo and Button logic functions (existing - ensure they are complete)
 ServoAngles interpolateDirection(float angle) {
     int baseSector = (int)(angle / 45.0f);
     if (baseSector < 0) baseSector = 0; 
@@ -127,18 +367,17 @@ ServoAngles interpolateDirection(float angle) {
     return result;
 }
 
-void moveServos(float s1, float s2, float s3) { // Accepts floats
+void moveServos(float s1, float s2, float s3) {
     currentServo1Pos = constrain(s1, (float)MIN_ANGLE_1, (float)MAX_ANGLE_1);
     currentServo2Pos = constrain(s2, (float)MIN_ANGLE_2, (float)MAX_ANGLE_2);
     currentServo3Pos = constrain(s3, (float)MIN_ANGLE_3, (float)MAX_ANGLE_3);
     
-    servo1.write(round(currentServo1Pos)); // Write rounded int to servo
+    servo1.write(round(currentServo1Pos));
     servo2.write(round(currentServo2Pos));
     servo3.write(round(currentServo3Pos));
     
-    // Reduced frequency debug output
     static unsigned long lastServoDebugTime = 0;
-    if (millis() - lastServoDebugTime > 200) { // Output every 200ms
+    if (millis() - lastServoDebugTime > 200) {
         Serial.print("舵机目标(float): ");
         Serial.print(currentServo1Pos, 2); Serial.print(", ");
         Serial.print(currentServo2Pos, 2); Serial.print(", ");
@@ -152,23 +391,18 @@ void moveServos(float s1, float s2, float s3) { // Accepts floats
 
 void moveToCenterPosition() {
     moveServos((float)SERVO1_CENTER, (float)SERVO2_CENTER, (float)SERVO3_CENTER);
-    // Serial.println("按钮: 舵机回到预设中心位置."); // Reduce verbosity
 }
 
-// UP button (e.g., D12) makes angles INCREASE
 void servoAnglesIncrease() {
     moveServos(currentServo1Pos + ANGLE_STEP, 
                currentServo2Pos + ANGLE_STEP, 
                currentServo3Pos + ANGLE_STEP);
-    // Serial.println("按钮: 角度增加中..."); // Reduce verbosity for continuous hold
 }
 
-// DOWN button (e.g., D11) makes angles DECREASE
 void servoAnglesDecrease() {
     moveServos(currentServo1Pos - ANGLE_STEP, 
                currentServo2Pos - ANGLE_STEP, 
                currentServo3Pos - ANGLE_STEP);
-    // Serial.println("按钮: 角度减少中..."); // Reduce verbosity for continuous hold
 }
 
 void resetToMinPosition() { 
@@ -184,14 +418,12 @@ void mapJoystickToServos() {
     float angle_rad = atan2(y_mapped, x_mapped);
     float angle_deg = angle_rad * 180.0f / PI;
     if (angle_deg < 0) angle_deg += 360.0f;
-    float strength = sqrt(x_mapped*x_mapped + y_mapped*y_mapped); // Raw strength 0-~141
+    float strength = sqrt(x_mapped*x_mapped + y_mapped*y_mapped);
 
-    if (strength / 100.0f < DEADZONE) { // Normalize strength for deadzone check
-        // Joystick is in deadzone, servos hold current position.
+    if (strength / 100.0f < DEADZONE) {
         return; 
     }
     
-    // Normalize strength: 0 at deadzone edge, 1 at full deflection (approx 100 for map output)
     float normalized_strength = (strength - (DEADZONE * 100.0f)) / (100.0f - (DEADZONE * 100.0f));
     normalized_strength = constrain(normalized_strength, 0.0f, 1.0f);
 
@@ -205,15 +437,9 @@ void mapJoystickToServos() {
                currentServo2Pos + delta2, 
                currentServo3Pos + delta3);
 
-    // Optional: Reduced frequency joystick debug output
     static unsigned long lastJoyDebug = 0;
-    if (millis() - lastJoyDebug > 250) { 
-       // Serial.print("遥感: Str="); Serial.print(strength,1);
-       // Serial.print(" NormStr="); Serial.print(normalized_strength,2);
-       // Serial.print(" Ang="); Serial.print(angle_deg,1);
-       // Serial.print(" TargetDir(S1)="); Serial.print(targetDirectionPos.servo1);
-       // Serial.print(" Delta1="); Serial.println(delta1, 2);
-       lastJoyDebug = millis();
+    if (millis() - lastJoyDebug > 250) {
+        lastJoyDebug = millis();
     }
 }
 
@@ -229,57 +455,29 @@ void handleButtons() {
       btn.stableState = reading; 
     }
 
-    // After debouncing, if button is firmly pressed (stableState is LOW)
     if (btn.stableState == LOW) { 
         if (btn.pin == UP_PIN) {
-          servoAnglesIncrease(); // Continuous action while held
+          servoAnglesIncrease();
         } else if (btn.pin == DOWN_PIN) {
-          servoAnglesDecrease(); // Continuous action while held
+          servoAnglesDecrease();
         } else if (btn.pin == MOS_CONTROL_BUTTON_PIN) { 
-          if (!btn.actionTakenOnPress) { // Check the flag
+          if (!btn.actionTakenOnPress) {
             bool currentMosState = digitalRead(MOS_PIN);
             bool newMosState = !currentMosState;
             digitalWrite(MOS_PIN, newMosState);
             Serial.print("MOS_PIN (Pin 3) is now: ");
             Serial.println(newMosState ? "HIGH" : "LOW");
-            btn.actionTakenOnPress = true; // Set the flag after acting
+            btn.actionTakenOnPress = true;
           }
         } else if (btn.pin == CENTER_JOY_PIN) {
-          if (!btn.actionTakenOnPress) { // Check the flag
+          if (!btn.actionTakenOnPress) {
             moveToCenterPosition();
-            btn.actionTakenOnPress = true; // Set the flag after acting
+            btn.actionTakenOnPress = true;
           }
         }
-      } else { // Button is HIGH (released or not pressed)
-          btn.actionTakenOnPress = false; // Reset flag when button is released - THIS IS THE CORRECT PLACE TO RESET
+      } else { 
+          btn.actionTakenOnPress = false;
       } 
   }
 }
-
-void setup() {
-    Serial.begin(9600); 
-    Serial.println("遥感(速率)和按钮控制 - V5 (长按)");
-    
-    pinMode(JOYSTICK_X_PIN, INPUT);
-    pinMode(JOYSTICK_Y_PIN, INPUT);
-    
-    pinMode(UP_PIN, INPUT_PULLUP);
-    pinMode(DOWN_PIN, INPUT_PULLUP);
-    pinMode(MOS_CONTROL_BUTTON_PIN, INPUT_PULLUP); // Changed from RESET_PIN
-    pinMode(CENTER_JOY_PIN, INPUT_PULLUP);
-    pinMode(MOS_PIN, OUTPUT); // MOS_PIN setup
-    digitalWrite(MOS_PIN, LOW); // Set initial state for MOS_PIN
-
-    servo1.attach(SERVO1_PIN);
-    servo2.attach(SERVO2_PIN);
-    servo3.attach(SERVO3_PIN);
-    
-    moveServos(currentServo1Pos, currentServo2Pos, currentServo3Pos);
-    Serial.println("初始位置已设置."); // currentServoXPos are already initialized
-}
-
-void loop() {
-    handleButtons();
-    mapJoystickToServos();
-    delay(SERVO_UPDATE_RATE);
-}
+// End of existing servo and button logic
